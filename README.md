@@ -91,10 +91,11 @@ mini-agent "generate a changelog"
 ### Flags
 
 - `--skills-dir <path>`: change skill directory (default: `.skills`)
-- `--model <name>`: change model (default: `claude-3-5-sonnet-latest`)
+- `--model <name>`: change model (default: `claude-sonnet-4-5-20250929`)
 - `--max-steps <n>`: limit tool-use loop (default: `8`)
 - `--no-tools`: disable tools (text-only)
-- `--verbose`: prints routing decisions to stderr
+- `--verbose`: show detailed skill scoring/candidates
+- `--quiet`: hide step-by-step logs (answer only)
 
 ## How matching works (high level)
 

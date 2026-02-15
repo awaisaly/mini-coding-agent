@@ -3,15 +3,122 @@ import { Command } from "commander";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
+import fs from "node:fs/promises";
 
 import { discoverSkills } from "./skills.js";
 import { syncExternalSkills } from "./external-skills.js";
 import { pickSkillsForPrompt, rankSkillsForPrompt } from "./skill-match.js";
 import { runAgentOnce } from "./agent.js";
 
+async function loadDotEnvIfPresent(cwd) {
+  const envPath = path.join(cwd, ".env");
+  let raw = "";
+  try {
+    raw = await fs.readFile(envPath, "utf8");
+  } catch {
+    return;
+  }
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const noExport = trimmed.startsWith("export ") ? trimmed.slice(7).trim() : trimmed;
+    const eq = noExport.indexOf("=");
+    if (eq === -1) continue;
+    const key = noExport.slice(0, eq).trim();
+    if (!key) continue;
+    let value = noExport.slice(eq + 1).trim();
+
+    // Remove surrounding quotes.
+    if (
+      (value.startsWith("\"") && value.endsWith("\"")) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    if (!(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
+}
+
 function getEnv(name) {
   const v = process.env[name];
   return v && String(v).trim() ? String(v).trim() : "";
+}
+
+function makeLogger({ quiet }) {
+  const start = Date.now();
+  const since = () => `${((Date.now() - start) / 1000).toFixed(1)}s`;
+
+  function log(level, msg) {
+    if (quiet) return;
+    const prefix = `[mini-agent] ${since()} ${level}`;
+    console.error(`${prefix} ${msg}`);
+  }
+
+  return {
+    info: (m) => log("INFO", m),
+    warn: (m) => log("WARN", m),
+    error: (m) => log("ERROR", m),
+    trace: (e) => {
+      if (quiet) return;
+      // Compact trace events for CLI visibility.
+      switch (e?.type) {
+        case "router:start":
+          log("INFO", `router: calling Claude (candidates=${(e.candidates || []).length})`);
+          break;
+        case "router:decision":
+          log(
+            "INFO",
+            `router: selected=${(e.selected || []).join(", ") || "none"}${e.reason ? ` (${e.reason})` : ""}`
+          );
+          break;
+        case "anthropic:request":
+          log(
+            "INFO",
+            `anthropic: request purpose=${e.purpose} model=${e.model} tools=${e.tools} messages=${e.messages}`
+          );
+          break;
+        case "anthropic:response": {
+          const inTok = e.usage?.input_tokens ?? e.usage?.inputTokens;
+          const outTok = e.usage?.output_tokens ?? e.usage?.outputTokens;
+          log(
+            "INFO",
+            `anthropic: response purpose=${e.purpose} stop=${e.stop_reason || "?"}${
+              inTok != null || outTok != null ? ` tokens_in=${inTok ?? "?"} tokens_out=${outTok ?? "?"}` : ""
+            }`
+          );
+          break;
+        }
+        case "agent:step_start":
+          log("INFO", `agent: step ${e.step + 1}/${e.maxSteps + 1} (thinking...)`);
+          break;
+        case "agent:step_response":
+          log("INFO", `agent: step ${e.step + 1} tool_uses=${e.tool_uses}`);
+          break;
+        case "tool:use":
+          log("INFO", `tool: ${e.name} (running)`);
+          break;
+        case "tool:result":
+          log("INFO", `tool: ${e.name} (${e.ok ? "ok" : "error"})`);
+          break;
+        case "match:none":
+          log("INFO", "match: no relevant skills");
+          break;
+        case "match:heuristic":
+          log("INFO", `match: heuristic → ${e.selected || "none"}`);
+          break;
+        case "match:router":
+          log("INFO", `match: router → ${(e.selected || []).join(", ") || "none"}`);
+          break;
+        default:
+          // ignore
+          break;
+      }
+    },
+  };
 }
 
 function printRouting({ prompt, localSkills, externalSkills, topCandidates, selectedSkills, matchMethod }) {
@@ -48,26 +155,33 @@ async function runOnePrompt({
   maxSteps,
   verbose,
   enableTools,
+  quiet,
 }) {
+  const logger = makeLogger({ quiet });
   const apiKey = getEnv("ANTHROPIC_API_KEY");
 
   if (syncExternal) {
+    logger.info("sync: external skills (starting)");
     try {
-      await syncExternalSkills(externalSkillsDir);
+      const res = await syncExternalSkills(externalSkillsDir);
+      const repos = res?.syncedRepos?.length || 0;
+      const skills = (res?.syncedRepos || []).reduce(
+        (acc, r) => acc + (Array.isArray(r.materializedSkills) ? r.materializedSkills.length : 0),
+        0
+      );
+      logger.info(`sync: external skills (done) repos=${repos} skills=${skills}`);
     } catch (err) {
-      if (verbose) {
-        console.error(
-          `[mini-agent] external skills sync failed: ${String(
-            err?.message || err
-          )}`
-        );
-      }
+      logger.warn(`sync: external skills failed (${String(err?.message || err)})`);
     }
   }
 
+  logger.info("discover: scanning skills");
   const localSkills = await discoverSkills(skillsDir);
   const externalSkills = await discoverSkills(externalSkillsDir);
   const discovered = mergeSkillsPreferLocal(localSkills, externalSkills);
+  logger.info(
+    `discover: local=${localSkills.length} external=${externalSkills.length} total=${discovered.length}`
+  );
 
   // Always compute and (optionally) show heuristic routing steps.
   const ranking = rankSkillsForPrompt({ prompt, skills: discovered });
@@ -77,9 +191,19 @@ async function runOnePrompt({
     skills: discovered,
     apiKey: apiKey || undefined,
     model,
+    trace: logger.trace,
   });
 
-  if (verbose || !apiKey) {
+  // Always show a short summary so the CLI never looks "stuck".
+  if (!quiet) {
+    logger.info(
+      `selected skill(s): ${match.selectedSkills.map((s) => s.name).join(", ") || "none"} (method=${
+        match.matchMethod || "unknown"
+      })`
+    );
+  }
+
+  if (verbose && !quiet) {
     printRouting({
       prompt,
       localSkills,
@@ -92,12 +216,11 @@ async function runOnePrompt({
 
   // If we don't have an API key, stop after routing (useful for dev testing).
   if (!apiKey) {
-    console.error(
-      `[mini-agent] ANTHROPIC_API_KEY not set. Routing complete; set the key to run Claude.`
-    );
+    logger.warn("ANTHROPIC_API_KEY not set. Routing complete; set the key to run Claude.");
     return;
   }
 
+  logger.info("agent: starting Claude run");
   const answer = await runAgentOnce({
     apiKey,
     model,
@@ -105,6 +228,7 @@ async function runOnePrompt({
     selectedSkills: match.selectedSkills,
     maxSteps,
     enableTools,
+    trace: logger.trace,
   });
 
   process.stdout.write(answer.trimEnd() + "\n");
@@ -139,6 +263,10 @@ async function runRepl(opts) {
 }
 
 async function main() {
+  // Allow local `.env` usage during development (without extra deps).
+  // Only sets variables that aren't already present in the environment.
+  await loadDotEnvIfPresent(process.cwd());
+
   const program = new Command();
   program
     .name("mini-agent")
@@ -163,11 +291,12 @@ async function main() {
     .option(
       "--model <name>",
       "Claude model name",
-      "claude-3-5-sonnet-latest"
+      "claude-sonnet-4-5-20250929"
     )
     .option("--max-steps <n>", "Max tool steps", "8")
     .option("--no-tools", "Disable tool use loop (LLM text only)")
     .option("--repl", "Start interactive REPL")
+    .option("--quiet", "Hide step-by-step logs (answer only)", false)
     .option("-v, --verbose", "Print routing decisions to stderr", false);
 
   program.parse(process.argv);
@@ -179,6 +308,7 @@ async function main() {
   const maxSteps = Math.max(0, Number.parseInt(opts.maxSteps, 10) || 0);
   const verbose = Boolean(opts.verbose);
   const enableTools = Boolean(opts.tools);
+  const quiet = Boolean(opts.quiet);
   const model = String(opts.model);
   const syncExternal = Boolean(opts.syncExternal);
 
@@ -191,6 +321,7 @@ async function main() {
       maxSteps,
       verbose,
       enableTools,
+      quiet,
     });
     return;
   }
@@ -214,6 +345,7 @@ async function main() {
           maxSteps,
           verbose,
           enableTools,
+          quiet,
         });
         return;
       }
@@ -227,6 +359,7 @@ async function main() {
       maxSteps,
       verbose,
       enableTools,
+      quiet,
     });
     return;
   }
@@ -240,6 +373,7 @@ async function main() {
     maxSteps,
     verbose,
     enableTools,
+    quiet,
   });
 }
 

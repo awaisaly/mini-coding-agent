@@ -88,7 +88,7 @@ function extractFirstJsonObject(text) {
   return null;
 }
 
-async function routeWithClaude({ apiKey, model, prompt, candidates }) {
+async function routeWithClaude({ apiKey, model, prompt, candidates, trace }) {
   const system =
     "You are a router that selects relevant Agent Skills for a user prompt.\n" +
     "You will receive a user prompt and a list of candidate skills (name, title, description).\n" +
@@ -108,12 +108,20 @@ async function routeWithClaude({ apiKey, model, prompt, candidates }) {
     })),
   };
 
+  trace?.({
+    type: "router:start",
+    model,
+    candidates: candidates.map((c) => c.name),
+  });
+
   const resp = await createClaudeMessage({
     apiKey,
     model,
     system,
     maxTokens: 300,
     messages: [{ role: "user", content: JSON.stringify(user, null, 2) }],
+    trace,
+    purpose: "router",
   });
 
   const text = (resp.content || [])
@@ -125,6 +133,11 @@ async function routeWithClaude({ apiKey, model, prompt, candidates }) {
   if (!json || !Array.isArray(json.selected)) return null;
 
   const selected = json.selected.map((x) => String(x)).filter(Boolean);
+  trace?.({
+    type: "router:decision",
+    selected,
+    reason: String(json.reason || ""),
+  });
   return { selected, reason: String(json.reason || "") };
 }
 
@@ -141,17 +154,22 @@ export function rankSkillsForPrompt({ prompt, skills }) {
   return { scored, best, topCandidates };
 }
 
-export async function pickSkillsForPrompt({ prompt, skills, apiKey, model }) {
+export async function pickSkillsForPrompt({ prompt, skills, apiKey, model, trace }) {
   if (!skills?.length) return { selectedSkills: [], routerDecision: null };
 
   const { best, topCandidates } = rankSkillsForPrompt({ prompt, skills });
   const candidateSkills = topCandidates.map((x) => x.skill);
 
   if (candidateSkills.length === 0 || best < 0.12) {
+    trace?.({ type: "match:none" });
     return { selectedSkills: [], routerDecision: null, matchMethod: "none" };
   }
 
   if (!apiKey) {
+    trace?.({
+      type: "match:heuristic",
+      selected: candidateSkills[0]?.name,
+    });
     return {
       selectedSkills: [candidateSkills[0]],
       routerDecision: null,
@@ -164,10 +182,15 @@ export async function pickSkillsForPrompt({ prompt, skills, apiKey, model }) {
     model,
     prompt,
     candidates: candidateSkills,
+    trace,
   });
 
   if (!routerDecision) {
     // Fallback: use the top heuristic match.
+    trace?.({
+      type: "match:heuristic",
+      selected: candidateSkills[0]?.name,
+    });
     return {
       selectedSkills: [candidateSkills[0]],
       routerDecision: null,
@@ -178,6 +201,10 @@ export async function pickSkillsForPrompt({ prompt, skills, apiKey, model }) {
   const selectedSet = new Set(routerDecision.selected);
   const selectedSkills = candidateSkills.filter((s) => selectedSet.has(s.name));
 
+  trace?.({
+    type: "match:router",
+    selected: selectedSkills.map((s) => s.name),
+  });
   return { selectedSkills, routerDecision, matchMethod: "router" };
 }
 
