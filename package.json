@@ -1,0 +1,21 @@
+{
+  "name": "mini-coding-agent",
+  "version": "0.1.0",
+  "description": "A mini Node.js coding agent CLI that loads Agent Skills from .skills/ and runs Claude Sonnet.",
+  "type": "module",
+  "bin": {
+    "mini-agent": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node ./src/cli.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "commander": "^13.1.0",
+    "fast-glob": "^3.3.3",
+    "js-yaml": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
