@@ -2,7 +2,7 @@
 
 A tiny Node.js CLI that implements the **Agent Skills** concept:
 
-- Discovers skills from a local `.skills/` directory (`.skills/**/SKILL.md`)
+- Discovers skills from a local `.skills/` directory (`.skills/**/SKILL.md`) and also supports community skills
 - Matches your prompt to relevant skills (loads **only** those skills into context)
 - Runs **Claude Sonnet** via Anthropic’s API
 
